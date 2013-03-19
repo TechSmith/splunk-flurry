@@ -57,6 +57,27 @@ URL. It should look something like:
             <type>text</type>
         </input>
     </block>
+
+
+   <block title="Edit Error Extraction Position" endpoint="configs/conf-extract" entity="error_extract_position">
+        <input field="year">
+            <label>Year (YYYY)</label>
+            <type>text</type>
+        </input>
+        <input field="month">
+            <label>Month (MM)</label>
+            <type>text</type>
+        </input>
+        <input field="day">
+            <label>Day (DD)</label>
+            <type>text</type>
+        </input>
+        <input field="offset">
+            <label>Offset**</label>
+            <type>text</type>
+        </input>
+    </block>
+
     <block title="">
         <text><![CDATA[
 <span style="color: blue;">

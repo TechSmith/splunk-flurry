@@ -30,7 +30,8 @@ from time import sleep
 CONFIG_FILENAME = 'extract'
 CONFIG_KEYS_NEEDING_REPLACEMENT = (
     ('auth', ('email', 'password', 'project_id')),
-    ('extract_position', ('year', 'month', 'day'))
+    ('extract_position', ('year', 'month', 'day')),
+    ('error_extract_position', ('year', 'month', 'day'))
 )
 
 class ConfigError(Exception):
@@ -110,6 +111,48 @@ class FlurryConnection(object):
                     'downloading event logs: %s.' % redirect_url)
         
         return resp
+
+    def download_error_log(self, yyyy, mm, dd, offset):
+        """
+        Downloads an individual page of errors that occurred on the specified
+        day, returning a file-like object containing CSV data.
+        
+        If the page does not exist, the returned CSV will not have any data
+        rows. However it will contain an initial header row.
+        
+        :param yyyy: year.
+        :param mm: month (1 = January, 12 = December).
+        :param dd: day.
+        :param offset: index of the first session that will be returned.
+        
+        :raises RateLimitedError: if Flurry denies access due to too many
+                                  requests in a short time frame.
+        :raises Exception: if the download fails for any other reason.
+        """
+        url = ('https://dev.flurry.com/exceptionLogsCsv.do?projectID=%d&' + 
+            'versionCut=versionsAll&intervalCut=customInterval' + 
+            '%04d_%02d_%02d-%04d_%02d_%02d&direction=1&offset=%d') % (
+                self.project_id, yyyy, mm, dd, yyyy, mm, dd, offset)
+        resp = self.browser.open(url)
+        
+        redirect_url = self.browser.geturl()
+        if redirect_url != url:
+            if redirect_url == 'http://www.flurry.com/rateLimit.html':
+                raise RateLimitedError
+            else:
+                raise Exception('Redirected to unexpected location while ' + 
+                    'downloading event logs: %s.' % redirect_url)
+        
+        return resp
+
+
+"""
+#currently this call gets exactly 20 logs at a time, there isn't a way to specify how many logs to get  
+
+"https://dev.flurry.com/exceptionLogsCsv.do?projectID=$PROJECT_ID&versionCut=versionsAll&intervalCut=allTime&direction=1&offset=0"
+
+"""
+
 
 UNESCAPER = HTMLParser()
 
@@ -212,6 +255,120 @@ for (section, keys) in CONFIG_KEYS_NEEDING_REPLACEMENT:
 
 did_login = False
 rate_limited_on_last_request = False
+
+# Pull Errors
+while True:
+    (year, month, day, offset) = (
+        int(config.get('error_extract_position', 'year')),
+        int(config.get('error_extract_position', 'month')),
+        int(config.get('error_extract_position', 'day')),
+        int(config.get('error_extract_position', 'offset')))
+    
+    # Since Flurry returns events in reverse chronological order,
+    # it is difficult to download events in a streaming fashion
+    # from the same day. Therefore only download up to the previous
+    # day's events.
+    cur_date = date(year, month, day)
+    if cur_date >= date.today():
+        log.info('All errors extracted up to yesterday.')
+        break
+    
+    if not did_login:
+        conn = FlurryConnection(
+            config.get('auth', 'email'),
+            config.get('auth', 'password'),
+            int(config.get('auth', 'project_id')))
+        conn.login()
+        did_login = True
+    
+    try:
+        log.info('Downloading Errors for : %04d-%02d-%02d @ %d', year, month, day, offset)
+        flurry_csv_stream = conn.download_error_log(year, month, day, offset)
+    except RateLimitedError:
+        if rate_limited_on_last_request:
+            # Abort temporarily
+            log.warning('Rate limited twice. Giving up.')
+            break
+        
+        delay = float(config.get('rate_limiting', 'delay_per_overlimit'))
+        log.info('Rate limited. Retrying in %s seconds(s).', delay)
+        sleep(delay)
+        
+        conn.login()
+        
+        rate_limited_on_last_request = True
+        continue
+    else:
+        rate_limited_on_last_request = False
+    
+    try:
+        flurry_csv = csv.reader(flurry_csv_stream)
+        
+        col_names = flurry_csv.next()
+        col_names = [col.strip() for col in col_names]  # strip whitespace
+
+        error_expected_col_names = [
+        'Timestamp', 'Index', 'Error', 'Message', 'Version',
+        'Error ID', 'Method', 'Platform']
+#        expected_col_names = [
+#            'Timestamp', 'Session Index', 'Event', 'Description', 'Version',
+#            'Platform', 'Device', 'User ID', 'Params']
+        assert col_names == error_expected_col_names
+        
+        num_sessions_read = 0
+        for row in flurry_csv:
+            row = [col.strip() for col in row]  # strip whitespace
+            
+            # Pull apart the row
+            (timestamp, index, error, message, version,
+                error_id, method, paltform) = row
+            
+            num_sessions_read += 1
+            
+            # Output the original row data
+            for i in xrange(len(col_names)):
+                (k, v) = (col_names[i], row[i])
+                output.write('%s=%s ' % (quote_k(k), quote_v(v)))
+            
+            # Append generated fields
+            output.write('%s=%s ' % (quote_k('Session'), quote_v(str(index))))
+                        
+            output.write('\r\n')
+        
+        output.flush()
+        
+        # Calculate next extraction offset
+        if num_sessions_read > 0:
+            # Potentially more sessions on the same day
+            
+            cur_offset = int(config.get('error_extract_position', 'offset'))
+            next_offset = cur_offset + num_sessions_read
+            
+            config.set('error_extract_position', 'offset', str(next_offset))
+            config.flush('error_extract_position')
+        else:
+            # All events on the current day have been read
+            
+            cur_date = date(
+                int(config.get('error_extract_position', 'year')),
+                int(config.get('error_extract_position', 'month')),
+                int(config.get('error_extract_position', 'day')))
+            
+            next_date = cur_date + timedelta(days=1)
+            
+            config.set('error_extract_position', 'year', str(next_date.year))
+            config.set('error_extract_position', 'month', str(next_date.month))
+            config.set('error_extract_position', 'day', str(next_date.day))
+            config.set('error_extract_position', 'offset', str(0))
+            config.flush('error_extract_position')
+    finally:
+        flurry_csv_stream.close()
+    
+    # Delay between requests to avoid flooding Flurry
+    sleep(float(config.get('rate_limiting', 'delay_per_request')))
+
+
+# Pull Events
 while True:
     (year, month, day, offset) = (
         int(config.get('extract_position', 'year')),
